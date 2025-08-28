@@ -2,6 +2,24 @@
  * MIT License
  *
  * Copyright (c) 2025
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #include <stdlib.h>
@@ -10,7 +28,6 @@
 #include "watch.h"
 #include "watch_private_display.h"
 
-// Helpers
 static inline void set_pix(uint8_t com, uint8_t seg) { watch_set_pixel(com, seg); }
 static inline void clr_pix(uint8_t com, uint8_t seg) { watch_clear_pixel(com, seg); }
 
@@ -30,8 +47,7 @@ static void build_unique_segments(entrop1c_state_t *state) {
             uint8_t seg = segmap & 0x3F;
             if (com <= 2 && seg < 24 && !seen[com][seg]) {
                 seen[com][seg] = 1;
-                state->seg_com[state->num_segments] = com;
-                state->seg_seg[state->num_segments] = seg;
+                state->seg_packed[state->num_segments] = PACK_SEG(com, seg);
                 state->num_segments++;
             }
             segmap >>= 8;
@@ -39,13 +55,17 @@ static void build_unique_segments(entrop1c_state_t *state) {
     }
 
     // Colon at (1,16)
-    if (!seen[1][16]) { seen[1][16] = 1; state->seg_com[state->num_segments] = 1; state->seg_seg[state->num_segments++] = 16; }
+    if (!seen[1][16]) {
+        seen[1][16] = 1;
+        state->seg_packed[state->num_segments++] = PACK_SEG(1, 16);
+    }
     // Indicators from watch_private_display.c IndicatorSegments
     const uint8_t ind_list[][2] = { {0,17}, {0,16}, {2,17}, {2,16}, {1,10} };
     for (size_t i = 0; i < sizeof(ind_list)/sizeof(ind_list[0]); i++) {
         uint8_t com = ind_list[i][0], seg = ind_list[i][1];
         if (com <= 2 && seg < 24 && !seen[com][seg]) {
-            seen[com][seg] = 1; state->seg_com[state->num_segments] = com; state->seg_seg[state->num_segments++] = seg;
+            seen[com][seg] = 1;
+            state->seg_packed[state->num_segments++] = PACK_SEG(com, seg);
         }
     }
     // Special pixels used for funky ninth segments / descenders: (0,15), (0,12), (1,12)
@@ -53,7 +73,8 @@ static void build_unique_segments(entrop1c_state_t *state) {
     for (size_t i = 0; i < sizeof(special)/sizeof(special[0]); i++) {
         uint8_t com = special[i][0], seg = special[i][1];
         if (com <= 2 && seg < 24 && !seen[com][seg]) {
-            seen[com][seg] = 1; state->seg_com[state->num_segments] = com; state->seg_seg[state->num_segments++] = seg;
+            seen[com][seg] = 1;
+            state->seg_packed[state->num_segments++] = PACK_SEG(com, seg);
         }
     }
 }
@@ -63,32 +84,66 @@ static uint32_t xorshift32(uint32_t *s) {
 }
 
 static void shuffle_order(entrop1c_state_t *state, uint32_t *rng) {
-    for (uint16_t i = 0; i < state->num_segments; i++) state->order[i] = i;
-    for (uint16_t i = state->num_segments; i > 1; i--) {
+    for (uint8_t i = 0; i < state->num_segments; i++) state->order[i] = i;
+    for (uint8_t i = state->num_segments; i > 1; i--) {
         uint32_t r = xorshift32(rng) % i;
-        uint16_t j = (uint16_t)r;
-        uint16_t tmp = state->order[i - 1];
+        uint8_t j = (uint8_t)r;
+        uint8_t tmp = state->order[i - 1];
         state->order[i - 1] = state->order[j];
         state->order[j] = tmp;
     }
 }
 
 static void assign_blink_rates(entrop1c_state_t *state, uint32_t *rng) {
-    for (uint16_t i = 0; i < state->num_segments; i++) {
-        state->blink_rate_hz[i] = (uint8_t)(1 + (xorshift32(rng) % 4)); // 1..4 Hz
-        state->tick_accum[i] = (uint8_t)(xorshift32(rng) & 0x03);        // initial tick phase 0..3
-        state->initial_state[i] = (uint8_t)(xorshift32(rng) & 0x01);
-        state->current_state[i] = 0;
+    memset(state->blink_config, 0, sizeof(state->blink_config));
+    memset(state->initial_state, 0, sizeof(state->initial_state));
+    memset(state->current_state, 0, sizeof(state->current_state));
+    
+    for (uint8_t i = 0; i < state->num_segments; i++) {
+        // Only use rates that divide evenly into 8Hz: 1Hz, 2Hz, 4Hz (skip 3Hz)
+        uint8_t rate_choice = (uint8_t)(xorshift32(rng) % 3);  // 0, 1, 2
+        uint8_t rate = (rate_choice == 0) ? 0 : (rate_choice == 1) ? 1 : 3; // maps to 1Hz, 2Hz, 4Hz
+        uint8_t accum = (uint8_t)(xorshift32(rng) & 0x03); // 0..3 phase
+        
+        // Pack rate (2 bits) and accum (2 bits) into 4 bits
+        uint8_t config = (rate << 2) | accum;
+        uint8_t byte_idx = i / 2;
+        if (i % 2 == 0) {
+            state->blink_config[byte_idx] = (state->blink_config[byte_idx] & 0xF0) | config;
+        } else {
+            state->blink_config[byte_idx] = (state->blink_config[byte_idx] & 0x0F) | (config << 4);
+        }
+        
+        // Set initial state bit
+        if (xorshift32(rng) & 0x01) {
+            SET_BIT(state->initial_state, i);
+        }
     }
+}
+
+static inline uint8_t get_blink_rate(entrop1c_state_t *state, uint8_t idx) {
+    uint8_t byte_idx = idx / 2;
+    uint8_t config = (idx % 2 == 0) ? 
+        (state->blink_config[byte_idx] & 0x0F) : 
+        ((state->blink_config[byte_idx] >> 4) & 0x0F);
+    return ((config >> 2) & 0x03) + 1; // Extract rate bits and add 1 for 1..4 Hz
+}
+
+static inline uint8_t get_tick_accum(entrop1c_state_t *state, uint8_t idx) {
+    uint8_t byte_idx = idx / 2;
+    uint8_t config = (idx % 2 == 0) ? 
+        (state->blink_config[byte_idx] & 0x0F) : 
+        ((state->blink_config[byte_idx] >> 4) & 0x0F);
+    return config & 0x03; // Extract accum bits
 }
 
 static void compute_chunk_counts(entrop1c_state_t *state) {
     // Turn on 1/6 of the full set every 10 seconds, rounding as needed to sum to num_segments
-    uint16_t base = state->num_segments / 6;
-    uint16_t rem = state->num_segments % 6;
-    uint16_t sum = 0;
+    uint8_t base = state->num_segments / 6;
+    uint8_t rem = state->num_segments % 6;
+    uint8_t sum = 0;
     for (uint8_t k = 0; k < 6; k++) {
-        uint16_t c = base + (k < rem ? 1 : 0);
+        uint8_t c = base + (k < rem ? 1 : 0);
         state->chunk_counts[k] = c;
         sum += c;
         state->cumulative_counts[k] = sum;
@@ -96,10 +151,11 @@ static void compute_chunk_counts(entrop1c_state_t *state) {
 }
 
 static void turn_off_all(entrop1c_state_t *state) {
-    for (uint16_t i = 0; i < state->num_segments; i++) {
-        clr_pix(state->seg_com[i], state->seg_seg[i]);
-        state->current_state[i] = 0;
+    for (uint8_t i = 0; i < state->num_segments; i++) {
+        uint8_t packed = state->seg_packed[i];
+        clr_pix(UNPACK_COM(packed), UNPACK_SEG(packed));
     }
+    memset(state->current_state, 0, sizeof(state->current_state));
 }
 
 void entrop1c_face_setup(movement_settings_t *settings, uint8_t watch_face_index, void ** context_ptr) {
@@ -116,7 +172,8 @@ void entrop1c_face_activate(movement_settings_t *settings, void *context) {
     entrop1c_state_t *state = (entrop1c_state_t *)context;
 
     if (watch_tick_animation_is_running()) watch_stop_tick_animation();
-    movement_request_tick_frequency(4); // 4 Hz updates to support 1..4 Hz blinking
+    movement_request_tick_frequency(1); // Start at 1Hz, increase when segments activate
+    state->current_freq = 1;
 
     watch_clear_display();
 
@@ -132,64 +189,63 @@ void entrop1c_face_activate(movement_settings_t *settings, void *context) {
     assign_blink_rates(state, &seed);
     compute_chunk_counts(state);
 
-    state->last_hour = now.unit.hour;
+    state->last_hour = 0xFF; // Force update on first tick
     turn_off_all(state);
 }
 
-static uint16_t segments_should_be_active(entrop1c_state_t *state, uint8_t minute) {
+static uint8_t segments_should_be_active(entrop1c_state_t *state, uint8_t minute) {
     // 0-9 min => chunk0, 10-19 => chunk1, ... 50-59 => chunk5
     uint8_t chunk = minute / 10; if (chunk > 5) chunk = 5;
     return state->cumulative_counts[chunk];
 }
 
-static void apply_activation_and_blink(entrop1c_state_t *state, uint8_t subsecond, uint16_t active_target) {
+static void apply_activation_and_blink(entrop1c_state_t *state, uint8_t subsecond, uint8_t active_target) {
     // First ensure only the first N in shuffled order are considered active
-    for (uint16_t idx = 0; idx < state->num_segments; idx++) {
-        uint16_t seg_index = state->order[idx];
+    for (uint8_t idx = 0; idx < state->num_segments; idx++) {
+        uint8_t seg_index = state->order[idx];
         bool is_active = (idx < active_target);
+        uint8_t packed = state->seg_packed[seg_index];
+        uint8_t com = UNPACK_COM(packed);
+        uint8_t seg = UNPACK_SEG(packed);
+        bool current_on = GET_BIT(state->current_state, seg_index);
 
         if (!is_active) {
-            if (state->current_state[seg_index]) {
-                clr_pix(state->seg_com[seg_index], state->seg_seg[seg_index]);
-                state->current_state[seg_index] = 0;
+            if (current_on) {
+                clr_pix(com, seg);
+                CLEAR_BIT(state->current_state, seg_index);
             }
             continue;
         }
 
-        // Blink per 4 Hz base tick: toggle state depending on configured rate
-        // Use accumulator to approximate 1..4 toggles/sec on a 4 Hz update clock
-        // For rate r toggles/sec, toggle on every (4/r) ticks with phase offset.
-        uint8_t rate = state->blink_rate_hz[seg_index]; // 1..4
-        uint8_t period_ticks = (uint8_t)(4 / rate);     // 4,2,1,1 for 1..4 Hz
-
-        // Spread randomness with initial phase: add subsecond to accumulator modulo period
-        uint8_t phase = state->tick_accum[seg_index];
+        // Get blink configuration
+        uint8_t rate = get_blink_rate(state, seg_index);    // 1, 2, or 4 Hz
+        uint8_t phase = get_tick_accum(state, seg_index);   // 0..3 phase
+        
+        // At 8Hz base frequency, calculate proper toggling
         bool on;
-        if (rate >= 4) {
-            // 4 Hz: alternate every tick, use phase
-            on = ((subsecond + phase) & 1) == 0;
-        } else if (rate == 3) {
-            // approximate 3 Hz: on 3 ticks, off 1 tick (75% duty), rotate phase
-            on = ((subsecond + phase) % 4) != 3;
+        if (rate == 4) {
+            // 4 Hz: toggle every 2 ticks (8Hz/4Hz = 2)
+            on = (((subsecond + phase) / 2) & 1) == 0;
         } else if (rate == 2) {
-            // 2 Hz: on for 1 tick, off for 1 tick
-            on = (((subsecond + phase) & 1) == 0);
+            // 2 Hz: toggle every 4 ticks (8Hz/2Hz = 4)
+            on = (((subsecond + phase) / 4) & 1) == 0;
         } else {
-            // 1 Hz: on 1 tick, off 3 ticks (25% duty) with phase
-            on = ((subsecond + phase) % 4) == 0;
+            // 1 Hz: toggle every 8 ticks (8Hz/1Hz = 8)
+            on = (((subsecond + phase) / 8) & 1) == 0;
         }
+        
         // Randomize initial state impact
-        if (state->initial_state[seg_index]) on = !on;
+        if (GET_BIT(state->initial_state, seg_index)) on = !on;
 
         if (on) {
-            if (!state->current_state[seg_index]) {
-                set_pix(state->seg_com[seg_index], state->seg_seg[seg_index]);
-                state->current_state[seg_index] = 1;
+            if (!current_on) {
+                set_pix(com, seg);
+                SET_BIT(state->current_state, seg_index);
             }
         } else {
-            if (state->current_state[seg_index]) {
-                clr_pix(state->seg_com[seg_index], state->seg_seg[seg_index]);
-                state->current_state[seg_index] = 0;
+            if (current_on) {
+                clr_pix(com, seg);
+                CLEAR_BIT(state->current_state, seg_index);
             }
         }
     }
@@ -205,19 +261,29 @@ bool entrop1c_face_loop(movement_event_t event, movement_settings_t *settings, v
         case EVENT_LOW_ENERGY_UPDATE: {
             watch_date_time now = watch_rtc_get_date_time();
 
-            // On hour rollover, clear and re-randomize
+            // On hour rollover, turn off all segments and re-randomize
             if (now.unit.hour != state->last_hour) {
-                watch_clear_display();
+                turn_off_all(state);  // More efficient than watch_clear_display()
                 uint32_t seed = (now.reg ^ 0xC3C3C3C3u) + (now.unit.second * 1103515245u + 12345u);
                 shuffle_order(state, &seed);
                 assign_blink_rates(state, &seed);
                 compute_chunk_counts(state);
-                memset(state->current_state, 0, state->num_segments);
                 state->last_hour = now.unit.hour;
             }
 
-            uint16_t active_target = segments_should_be_active(state, now.unit.minute);
-            apply_activation_and_blink(state, event.subsecond & 0x03, active_target);
+            uint8_t active_target = segments_should_be_active(state, now.unit.minute);
+            
+            // Adaptive frequency: only use high frequency when segments are active
+            if (active_target > 0 && state->current_freq != 8) {
+                movement_request_tick_frequency(8);
+                state->current_freq = 8;
+            } else if (active_target == 0 && state->current_freq != 1) {
+                movement_request_tick_frequency(1);
+                state->current_freq = 1;
+            }
+            
+            uint8_t subsecond = (state->current_freq == 8) ? (event.subsecond & 0x07) : 0;
+            apply_activation_and_blink(state, subsecond, active_target);
 
             break;
         }
