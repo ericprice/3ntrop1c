@@ -272,18 +272,43 @@ bool entrop1c_face_loop(movement_event_t event, movement_settings_t *settings, v
             }
 
             uint8_t active_target = segments_should_be_active(state, now.unit.minute);
-            
-            // Adaptive frequency: only use high frequency when segments are active
-            if (active_target > 0 && state->current_freq != 8) {
-                movement_request_tick_frequency(8);
-                state->current_freq = 8;
-            } else if (active_target == 0 && state->current_freq != 1) {
-                movement_request_tick_frequency(1);
-                state->current_freq = 1;
+
+            bool low_energy = (event.event_type == EVENT_LOW_ENERGY_UPDATE);
+
+            if (low_energy) {
+                // Low-power mode: render a static snapshot at 1 Hz (no blinking)
+                if (state->current_freq != 1) {
+                    movement_request_tick_frequency(1);
+                    state->current_freq = 1;
+                }
+                // Ensure only the first N are on, rest are off
+                for (uint8_t idx = 0; idx < state->num_segments; idx++) {
+                    uint8_t seg_index = state->order[idx];
+                    uint8_t packed = state->seg_packed[seg_index];
+                    uint8_t com = UNPACK_COM(packed);
+                    uint8_t seg = UNPACK_SEG(packed);
+                    bool should_on = (idx < active_target);
+                    bool is_on = GET_BIT(state->current_state, seg_index);
+                    if (should_on && !is_on) {
+                        set_pix(com, seg);
+                        SET_BIT(state->current_state, seg_index);
+                    } else if (!should_on && is_on) {
+                        clr_pix(com, seg);
+                        CLEAR_BIT(state->current_state, seg_index);
+                    }
+                }
+            } else {
+                // Adaptive frequency: only use high frequency when segments are active
+                if (active_target > 0 && state->current_freq != 8) {
+                    movement_request_tick_frequency(8);
+                    state->current_freq = 8;
+                } else if (active_target == 0 && state->current_freq != 1) {
+                    movement_request_tick_frequency(1);
+                    state->current_freq = 1;
+                }
+                uint8_t subsecond = (state->current_freq == 8) ? (event.subsecond & 0x07) : 0;
+                apply_activation_and_blink(state, subsecond, active_target);
             }
-            
-            uint8_t subsecond = (state->current_freq == 8) ? (event.subsecond & 0x07) : 0;
-            apply_activation_and_blink(state, subsecond, active_target);
 
             break;
         }
@@ -299,5 +324,4 @@ void entrop1c_face_resign(movement_settings_t *settings, void *context) {
     (void) state;
     movement_request_tick_frequency(1);
 }
-
 
