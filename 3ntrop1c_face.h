@@ -61,10 +61,10 @@ typedef struct {
 #define UNPACK_COM(packed) (((packed) >> 6) & 0x03)
 #define UNPACK_SEG(packed) ((packed) & 0x3F)
 
-void entrop1c_face_setup(movement_settings_t *settings, uint8_t watch_face_index, void ** context_ptr);
-void entrop1c_face_activate(movement_settings_t *settings, void *context);
-bool entrop1c_face_loop(movement_event_t event, movement_settings_t *settings, void *context);
-void entrop1c_face_resign(movement_settings_t *settings, void *context);
+void entrop1c_face_setup(uint8_t watch_face_index, void ** context_ptr);
+void entrop1c_face_activate(void *context);
+bool entrop1c_face_loop(movement_event_t event, void *context);
+void entrop1c_face_resign(void *context);
 
 #define entrop1c_face ((const watch_face_t){ \
     entrop1c_face_setup, \
@@ -75,5 +75,4 @@ void entrop1c_face_resign(movement_settings_t *settings, void *context);
 })
 
 #endif // N3TROP1C_FACE_H_
-
 

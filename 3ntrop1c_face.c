@@ -26,7 +26,7 @@
 #include <string.h>
 #include "3ntrop1c_face.h"
 #include "watch.h"
-#include "watch_private_display.h"
+#include "watch_common_display.h"
 
 static inline void set_pix(uint8_t com, uint8_t seg) { watch_set_pixel(com, seg); }
 static inline void clr_pix(uint8_t com, uint8_t seg) { watch_clear_pixel(com, seg); }
@@ -40,17 +40,17 @@ static void build_unique_segments(entrop1c_state_t *state) {
     state->num_segments = 0;
 
     for (uint8_t position = 0; position < 10; position++) {
-        uint64_t segmap = Segment_Map[position];
-        // each character uses 8 segment slots; COM3 means absent
+        const digit_mapping_t map = (watch_get_lcd_type() == WATCH_LCD_TYPE_CUSTOM)
+            ? Custom_LCD_Display_Mapping[position]
+            : Classic_LCD_Display_Mapping[position];
         for (int i = 0; i < 8; i++) {
-            uint8_t com = (segmap & 0xFF) >> 6;
-            uint8_t seg = segmap & 0x3F;
+            if (map.segment[i].value == segment_does_not_exist) continue;
+            uint8_t com = map.segment[i].address.com;
+            uint8_t seg = map.segment[i].address.seg;
             if (com <= 2 && seg < 24 && !seen[com][seg]) {
                 seen[com][seg] = 1;
-                state->seg_packed[state->num_segments] = PACK_SEG(com, seg);
-                state->num_segments++;
+                state->seg_packed[state->num_segments++] = PACK_SEG(com, seg);
             }
-            segmap >>= 8;
         }
     }
 
@@ -158,8 +158,8 @@ static void turn_off_all(entrop1c_state_t *state) {
     memset(state->current_state, 0, sizeof(state->current_state));
 }
 
-void entrop1c_face_setup(movement_settings_t *settings, uint8_t watch_face_index, void ** context_ptr) {
-    (void) settings; (void) watch_face_index;
+void entrop1c_face_setup(uint8_t watch_face_index, void ** context_ptr) {
+    (void) watch_face_index;
     if (*context_ptr == NULL) {
         entrop1c_state_t *state = (entrop1c_state_t *)malloc(sizeof(entrop1c_state_t));
         memset(state, 0, sizeof(*state));
@@ -167,11 +167,10 @@ void entrop1c_face_setup(movement_settings_t *settings, uint8_t watch_face_index
     }
 }
 
-void entrop1c_face_activate(movement_settings_t *settings, void *context) {
-    (void) settings;
+void entrop1c_face_activate(void *context) {
     entrop1c_state_t *state = (entrop1c_state_t *)context;
 
-    if (watch_tick_animation_is_running()) watch_stop_tick_animation();
+    if (watch_sleep_animation_is_running()) watch_stop_sleep_animation();
     movement_request_tick_frequency(1); // Start at 1Hz, increase when segments activate
     state->current_freq = 1;
 
@@ -183,7 +182,7 @@ void entrop1c_face_activate(movement_settings_t *settings, void *context) {
     }
 
     // Seed RNG from RTC time
-    watch_date_time now = watch_rtc_get_date_time();
+            watch_date_time_t now = movement_get_local_date_time();
     uint32_t seed = (now.reg ^ 0xA5A5A5A5u) + (now.unit.second * 1664525u + 1013904223u);
     shuffle_order(state, &seed);
     assign_blink_rates(state, &seed);
@@ -251,15 +250,14 @@ static void apply_activation_and_blink(entrop1c_state_t *state, uint8_t subsecon
     }
 }
 
-bool entrop1c_face_loop(movement_event_t event, movement_settings_t *settings, void *context) {
-    (void) settings;
+bool entrop1c_face_loop(movement_event_t event, void *context) {
     entrop1c_state_t *state = (entrop1c_state_t *)context;
 
     switch (event.event_type) {
         case EVENT_ACTIVATE:
         case EVENT_TICK:
         case EVENT_LOW_ENERGY_UPDATE: {
-            watch_date_time now = watch_rtc_get_date_time();
+            watch_date_time_t now = watch_rtc_get_date_time();
 
             // On hour rollover, turn off all segments and re-randomize
             if (now.unit.hour != state->last_hour) {
@@ -313,15 +311,13 @@ bool entrop1c_face_loop(movement_event_t event, movement_settings_t *settings, v
             break;
         }
         default:
-            return movement_default_loop_handler(event, settings);
+            return movement_default_loop_handler(event);
     }
     return true;
 }
 
-void entrop1c_face_resign(movement_settings_t *settings, void *context) {
-    (void) settings;
+void entrop1c_face_resign(void *context) {
     entrop1c_state_t *state = (entrop1c_state_t *)context;
     (void) state;
     movement_request_tick_frequency(1);
 }
-
